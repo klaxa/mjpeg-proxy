@@ -1,6 +1,11 @@
 default:
   port: 8080
-  cam_1:
-    path: cam-1.mjpeg
-    url: http://some-stream.com/stream.mjpeg
-    fps: 25
+  streams:
+    cam_1:
+      path: cam-1.mjpeg
+      url: http://some-stream.com/stream.mjpeg
+      fps: 25
+    cam_2:
+      path: cam-2.mjpeg
+      url: http://some-stream.com/stream2.mjpeg
+      fps: 25
