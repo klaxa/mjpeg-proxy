@@ -65,7 +65,7 @@ async fn serve(
         Ok(hyper::Response::builder()
             .header(
                 http::header::CONTENT_TYPE,
-                "multipart/mixed; boundary=".to_string() + BOUNDARY_STRING,
+                "multipart/x-mixed-replace; boundary=".to_string() + BOUNDARY_STRING,
             )
             .body(hyper::Body::wrap_stream(stream))?)
     } else {
