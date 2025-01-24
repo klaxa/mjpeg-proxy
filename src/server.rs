@@ -32,6 +32,10 @@ const fn _none<T>() -> Option<T> {
     None
 }
 
+const fn _default_fps() -> u8 {
+    25
+}
+
 const fn _default_port() -> u16 {
     8080
 }
@@ -86,6 +90,7 @@ async fn serve(
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Stream {
+    #[serde(default = "_default_fps")]
     pub fps: u8,
     pub url: String,
     pub path: String,
