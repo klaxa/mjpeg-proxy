@@ -10,11 +10,13 @@ name = "mjpeg_proxy"
 futures = "0.3.31"
 mime = "0.3.17"
 multipart-stream = "0.1.2"
+multipart_http = { version = "^0.2.4", package = "http" } # explicitely depend on http version from multipart-stream so we can create necessary structures
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
-hyper = { version = "0.14", features = ["http1", "client", "server", "stream", "tcp"] }
 lazy-static-include = "3.2.1"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 lazy_static = "1.5.0"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_yaml = "0.9.34"
 chrono = "0.4.39"
+axum = { version = "0.8.1", features = [] }
+reqwest = { version = "0.12.12", features = ["stream"] }

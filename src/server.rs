@@ -1,18 +1,19 @@
+use axum::{
+    body::{Body, Bytes},
+    extract::{ConnectInfo, Request, State},
+    http::header::CONTENT_TYPE,
+    response::Response,
+    routing::get,
+    Router,
+};
 use chrono::Local;
 use futures::StreamExt;
-use hyper::{
-    self as http,
-    body::Bytes,
-    header::{CONTENT_LENGTH, CONTENT_TYPE},
-    server::conn::AddrStream,
-    service::{make_service_fn, service_fn},
-    Body, HeaderMap, Request, Response,
-};
 use lazy_static_include::lazy_static_include_bytes;
 use multipart_stream::Part;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -45,10 +46,10 @@ fn _localhost() -> String {
 }
 
 async fn serve(
-    req: Request<Body>,
-    config: Arc<HashMap<String, Arc<Mutex<broadcast::Sender<Part>>>>>,
-    raddr: String,
-) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+    State(config): State<Arc<HashMap<String, Arc<Mutex<broadcast::Sender<Part>>>>>>,
+    ConnectInfo(raddr): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
     let path = req.uri().to_string();
     let version = req.version();
     let date = Local::now();
@@ -57,7 +58,7 @@ async fn serve(
     if let Some(r) = res {
         println!(
             "{} - - [{}] \"{} {} {:?}\" 200 -",
-            raddr,
+            raddr.ip(),
             date.format("%d/%m/%Y:%H:%M:%S %z"),
             method,
             path,
@@ -66,25 +67,27 @@ async fn serve(
         let recv = r.lock().unwrap().subscribe();
         let stream = BroadcastStream::new(recv);
         let stream = multipart_stream::serialize(stream, BOUNDARY_STRING);
-        Ok(hyper::Response::builder()
+        Response::builder()
             .header(
-                http::header::CONTENT_TYPE,
+                CONTENT_TYPE,
                 "multipart/x-mixed-replace; boundary=".to_string() + BOUNDARY_STRING,
             )
-            .body(hyper::Body::wrap_stream(stream))?)
+            .body(Body::from_stream(stream))
+            .unwrap() // TODO: Proper error handling
     } else {
         println!(
             "{} - - [{}] \"{} {} {:?}\" 404 13",
-            raddr,
+            raddr.ip(),
             date.format("%d/%m/%Y:%H:%M:%S %z"),
             method,
             path,
             version
         );
         println!("404 returned");
-        Ok(hyper::Response::builder()
+        Response::builder()
             .status(404)
-            .body(hyper::Body::from("404 Not found"))?)
+            .body(Body::from("404 Not found"))
+            .unwrap() // TODO: Proper error handling
     }
 }
 
@@ -108,14 +111,6 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(config: Server) -> Self {
-        Server {
-            streams: config.streams,
-            port: config.port,
-            address: config.address,
-        }
-    }
-
     pub fn init(&mut self) {
         for (_stream_name, stream) in &mut self.streams {
             if !stream.path.starts_with("/") {
@@ -127,7 +122,7 @@ impl Server {
     }
 
     pub async fn run(&self) {
-        let addr = format!("{}:{}", &self.address, self.port).parse().unwrap();
+        let addr: SocketAddr = format!("{}:{}", &self.address, self.port).parse().unwrap();
         let mut handles = Vec::new();
         let mut stream_config = Arc::new(HashMap::new());
         let mut config = HashMap::new();
@@ -139,32 +134,25 @@ impl Server {
             config.insert(v.1.path.clone(), v.1.clone());
         }
 
-        let make_svc = make_service_fn({
-            move |conn: &AddrStream| {
-                let raddr = conn.remote_addr().to_string();
-                futures::future::ok::<_, std::convert::Infallible>(service_fn({
-                    let v1 = Arc::clone(&stream_config);
-                    let v2 = raddr.clone();
-                    move |req| {
-                        let v3 = Arc::clone(&v1);
-                        let v4 = v2.clone();
-                        serve(req, v3, v4)
-                    }
-                }))
-            }
-        });
+        let app = Router::new()
+            .route("/{*_}", get(serve))
+            .with_state(stream_config)
+            .into_make_service_with_connect_info::<SocketAddr>();
 
-        tokio::spawn(async move {
-            let server = hyper::Server::bind(&addr).serve(make_svc);
-            println!("Serving on http://{}", server.local_addr());
-            server.await.unwrap()
-        });
+        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         for stream in config.into_iter() {
             let default_body = Bytes::from(&DEFAULT_BODY_CONTENT[..]);
-            let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "image/jpeg".parse().unwrap());
-            headers.insert(CONTENT_LENGTH, "8857".parse().unwrap());
+            let mut headers = multipart_http::HeaderMap::new();
+            headers.insert(
+                multipart_http::header::CONTENT_TYPE,
+                "image/jpeg".parse().unwrap(),
+            );
+            headers.insert(
+                multipart_http::header::CONTENT_LENGTH,
+                "8857".parse().unwrap(),
+            );
             let default_part = Part {
                 headers,
                 body: default_body,
@@ -206,8 +194,7 @@ impl Server {
             let handle = tokio::spawn(async move {
                 let mut backoff_secs = 1;
                 loop {
-                    let client = hyper::Client::new();
-                    let res = client.get(stream.1.url.parse().unwrap()).await;
+                    let res = reqwest::get(&stream.1.url).await;
                     if res.is_err() {
                         eprintln!("err: {:?}", res.err().unwrap());
                         eprintln!("trying again in {} seconds.", backoff_secs);
@@ -228,13 +215,13 @@ impl Server {
                     println!("Reading {}", &stream.1.url);
                     let content_type: mime::Mime = res
                         .headers()
-                        .get(http::header::CONTENT_TYPE)
+                        .get(CONTENT_TYPE)
                         .unwrap()
                         .to_str()
                         .unwrap()
                         .parse()
                         .unwrap();
-                    let stream = res.into_body();
+                    let stream = res.bytes_stream();
                     let boundary = content_type.get_param(mime::BOUNDARY).unwrap();
                     let mut stream = multipart_stream::parse(stream, boundary.as_str());
                     assert_eq!(content_type.type_(), "multipart");
