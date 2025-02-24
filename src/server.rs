@@ -1,37 +1,19 @@
 use axum::{
-    body::{Body, Bytes},
+    body::Body,
     extract::{ConnectInfo, Request, State},
     http::header::CONTENT_TYPE,
     response::Response,
     routing::get,
-    Router,
+    Error, Router,
 };
 use chrono::Local;
 use futures::StreamExt;
-use lazy_static_include::lazy_static_include_bytes;
-use multipart_stream::Part;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-use tokio::{
-    sync::{broadcast, watch},
-    time::{interval, sleep},
-};
-use tokio_stream::wrappers::BroadcastStream;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-lazy_static_include_bytes! {
-    DEFAULT_BODY_CONTENT => "res/no_feed_640x480.jpg",
-}
+use crate::connection::Connection;
 
 const BOUNDARY_STRING: &str = "-----mjpeg-proxy-boundary-----";
-
-const fn _none<T>() -> Option<T> {
-    None
-}
 
 const fn _default_fps() -> u8 {
     25
@@ -46,7 +28,7 @@ fn _localhost() -> String {
 }
 
 async fn serve(
-    State(config): State<Arc<HashMap<String, Arc<Mutex<broadcast::Sender<Part>>>>>>,
+    State(config): State<Arc<HashMap<String, Arc<Connection>>>>,
     ConnectInfo(raddr): ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Response {
@@ -64,9 +46,11 @@ async fn serve(
             path,
             version
         );
-        let recv = r.lock().unwrap().subscribe();
-        let stream = BroadcastStream::new(recv);
-        let stream = multipart_stream::serialize(stream, BOUNDARY_STRING);
+        let recv = Connection::subscribe(Arc::clone(r));
+        let stream = multipart_stream::serialize(
+            recv.map(|p| -> Result<_, Box<Error>> { Ok(p) }),
+            BOUNDARY_STRING,
+        );
         Response::builder()
             .header(
                 CONTENT_TYPE,
@@ -92,152 +76,50 @@ async fn serve(
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Stream {
+pub struct StreamConfig {
     #[serde(default = "_default_fps")]
-    pub fps: u8,
-    pub url: String,
-    pub path: String,
-    #[serde(skip, default = "_none::<Arc<Mutex<broadcast::Sender<Part>>>>")]
-    pub broadcaster: Option<Arc<Mutex<broadcast::Sender<Part>>>>,
+    fps: u8,
+    url: String,
+    path: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Server {
     #[serde(default = "_default_port")]
-    pub port: u16,
+    port: u16,
     #[serde(default = "_localhost")]
-    pub address: String,
-    pub streams: HashMap<String, Stream>,
+    address: String,
+    #[serde(rename(serialize = "streams", deserialize = "streams"))]
+    stream_configs: HashMap<String, StreamConfig>,
 }
 
 impl Server {
     pub fn init(&mut self) {
-        for (_stream_name, stream) in &mut self.streams {
+        for (_stream_name, stream) in &mut self.stream_configs {
             if !stream.path.starts_with("/") {
                 stream.path = format!("/{}", stream.path);
             }
-            let (tx, _) = broadcast::channel(1);
-            stream.broadcaster = Some(Arc::new(Mutex::new(tx)));
         }
     }
 
     pub async fn run(&self) {
         let addr: SocketAddr = format!("{}:{}", &self.address, self.port).parse().unwrap();
-        let mut handles = Vec::new();
-        let mut stream_config = Arc::new(HashMap::new());
-        let mut config = HashMap::new();
-        for v in self.streams.iter() {
-            Arc::get_mut(&mut stream_config).unwrap().insert(
+        let mut stream_config = HashMap::new();
+        for v in self.stream_configs.iter() {
+            stream_config.insert(
                 v.1.path.clone(),
-                Arc::clone(v.1.broadcaster.as_ref().unwrap()),
+                Arc::new(Connection::new(&*v.1.url, v.1.fps)),
             );
-            config.insert(v.1.path.clone(), v.1.clone());
+            println!("Serving {} on {} fps: {}", v.1.url, v.1.path, v.1.fps);
         }
 
         let app = Router::new()
             .route("/{*_}", get(serve))
-            .with_state(stream_config)
+            .with_state(Arc::new(stream_config))
             .into_make_service_with_connect_info::<SocketAddr>();
 
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        for stream in config.into_iter() {
-            let default_body = Bytes::from(&DEFAULT_BODY_CONTENT[..]);
-            let mut headers = multipart_http::HeaderMap::new();
-            headers.insert(
-                multipart_http::header::CONTENT_TYPE,
-                "image/jpeg".parse().unwrap(),
-            );
-            headers.insert(
-                multipart_http::header::CONTENT_LENGTH,
-                "8857".parse().unwrap(),
-            );
-            let default_part = Part {
-                headers,
-                body: default_body,
-            };
-            println!(
-                "Serving {} on {} fps: {}",
-                stream.1.url, stream.1.path, stream.1.fps
-            );
-
-            // start server broadcast channel writer
-            let (tx, mut rx) = watch::channel(default_part.clone());
-            tokio::spawn(async move {
-                // Use the equivalent of a "do-while" loop so the initial value is
-                // processed before awaiting the `changed()` future.
-                let mut interval = interval(Duration::from_micros(1000000 / stream.1.fps as u64));
-                loop {
-                    tokio::select!(
-                        _ = interval.tick() => {
-                            let latest = rx.borrow().clone();
-                            //println!("recv: {:?}", latest.headers);
-                            let bc = stream.1.broadcaster.as_ref().unwrap();
-                            let btx = bc.lock().unwrap();
-                            let _res = btx.send(latest);
-                            // ignore errors
-                            /*if res.is_err() {
-                             *                   println!("{:?}", res.err());
-                        }*/
-                        }
-                        res = rx.changed() => {
-                            if res.is_err() {
-                                break;
-                            }
-                        }
-                    )
-                }
-            });
-
-            // start reading camera
-            let handle = tokio::spawn(async move {
-                let mut backoff_secs = 1;
-                loop {
-                    let res = reqwest::get(&stream.1.url).await;
-                    if res.is_err() {
-                        eprintln!("err: {:?}", res.err().unwrap());
-                        eprintln!("trying again in {} seconds.", backoff_secs);
-                        tx.send(default_part.clone()).unwrap();
-                        sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = std::cmp::min(backoff_secs + backoff_secs, 300);
-                        continue;
-                    }
-                    let res = res.unwrap();
-                    if !res.status().is_success() {
-                        eprintln!("HTTP request failed with status {}", res.status());
-                        eprintln!("trying again in {} seconds.", backoff_secs);
-                        tx.send(default_part.clone()).unwrap();
-                        sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = std::cmp::min(backoff_secs + backoff_secs, 300);
-                        continue;
-                    }
-                    println!("Reading {}", &stream.1.url);
-                    let content_type: mime::Mime = res
-                        .headers()
-                        .get(CONTENT_TYPE)
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .parse()
-                        .unwrap();
-                    let stream = res.bytes_stream();
-                    let boundary = content_type.get_param(mime::BOUNDARY).unwrap();
-                    let mut stream = multipart_stream::parse(stream, boundary.as_str());
-                    assert_eq!(content_type.type_(), "multipart");
-                    while let Some(p) = stream.next().await {
-                        let p = p.unwrap();
-                        tx.send(p.clone()).unwrap();
-                        //println!("send {:?}", p.headers);
-                    }
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            let _ = handle.await;
-        }
+        axum::serve(listener, app).await.unwrap();
     }
 }

@@ -828,6 +828,7 @@ dependencies = [
  "serde_yaml",
  "tokio",
  "tokio-stream",
+ "tokio-util",
 ]
 
 [[package]]
