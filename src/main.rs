@@ -1,9 +1,6 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Example `hyper`-based HTTP client which parses a multipart stream.
-//! Run with the URL printed by `cargo run --example server` as its one argument.
-
 use tokio::task::JoinHandle;
 
 use mjpeg_proxy::config;
